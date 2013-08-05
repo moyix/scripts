@@ -230,7 +230,7 @@ class ResolveTaps(dlldump.DLLDump):
                 elif dbgdata[:4] == "NB10":
                     (guid,filename) = symchk.get_nb10(dbgdata)
                 else:
-                    debug.warn("ERR: CodeView section not NB10 or RSDS")
+                    debug.warning("ERR: CodeView section not NB10 or RSDS")
                     return
                 guid = guid.upper()
                 pdbname = self.get_file_by_guid(filename, guid)
@@ -260,14 +260,14 @@ class ResolveTaps(dlldump.DLLDump):
     def resolve_taps(self, taps, sorted_mods, as_getter):
         bases = [m[0] for m in sorted_mods]
         matching_mods = set()
-        addrs = set([a for tap in taps for a in tap[:2]])
+        addrs = set([a for tap in taps for a in tap[0]])
         for a in addrs:
             idx = bisect.bisect_right(bases, a)-1
             if idx == -1:
-                debug.warn("No matching module for %#010x" % a)
+                debug.warning("No matching module for %#010x" % a)
             m_base, m_size, m_name = sorted_mods[idx]
             if not (m_base <= a < m_base+m_size):
-                debug.warn("NOT %x <= %x < %x (%s)" % (m_base, a, m_base+m_size, m_name))
+                debug.warning("NOT %x <= %x < %x (%s)" % (m_base, a, m_base+m_size, m_name))
                 continue
             matching_mods.add((m_base, m_size, m_name))
 
@@ -277,19 +277,22 @@ class ResolveTaps(dlldump.DLLDump):
             ps_ad = as_getter(mod_base)
             if ps_ad.is_valid_address(mod_base):
                 pdbname = self.get_pdb(ps_ad, mod_name, mod_base)
-                pdb_list.append((pdbname, mod_base))
+                if pdbname:
+                    pdb_list.append((pdbname, mod_base))
+                else:
+                    debug.warning('No PDB found for {0} at {1:8x}'.format(mod_name, mod_base))
             else:
-                debug.warn('Cannot check {0} at {1:8x}'.format(mod_name, mod_base))
+                debug.warning('Cannot check {0} at {1:8x}'.format(mod_name, mod_base))
         
         # Do the lookups
         lobj = lookup.Lookup(pdb_list)
-        for caller, pc, cr3 in taps:
-            caller_s = lobj.lookup(caller)
-            caller_s = self.format_name(caller_s, caller, bases, sorted_mods)
-            pc_s = lobj.lookup(pc)
-            pc_s = self.format_name(pc_s, pc, bases, sorted_mods)
-                            
-            yield caller, caller_s, pc, pc_s, cr3
+        for stack, cr3 in taps:
+            symbols = []
+            for addr in stack:
+                addr_s = lobj.lookup(addr)
+                addr_s = self.format_name(addr_s, addr, bases, sorted_mods)
+                symbols.append(addr_s)
+            yield stack, symbols, cr3
 
     def calculate(self):
         if self._config.TAP_FILE is None or not os.path.exists(self._config.TAP_FILE):
@@ -298,16 +301,16 @@ class ResolveTaps(dlldump.DLLDump):
 
         taps = []
         for line in taplist :
-            (caller, pc, cr3) = line.split()
+            line = line.split()
+            (stack, cr3) = line[:-1], line[-1]
             try:
-                caller = int(caller,16)
-                pc = int(pc,16)
+                stack = [int(s,16) for s in stack]
                 cr3 = int(cr3,16)
             except ValueError:
                 debug.error("Tap file format invalid.")
-            taps.append((caller, pc, cr3))
+            taps.append((stack, cr3))
 
-        cr3s = set(t[2] for t in taps)
+        cr3s = set(t[1] for t in taps)
         cr3s.discard(0)
 
         # First do the userland ones
@@ -323,7 +326,7 @@ class ResolveTaps(dlldump.DLLDump):
             print ">>> Working on {0}[{1}]".format(proc.ImageFileName, proc.UniqueProcessId)
 
             ps_ad = proc.get_process_address_space()
-            proc_taps = [t for t in taps if t[2] == cr3]
+            proc_taps = [t for t in taps if t[1] == cr3]
             mods = list(proc.get_load_modules())
             sorted_mods = sorted([(m.DllBase.v(),m.SizeOfImage.v(),str(m.BaseDllName)) for m in mods])
 
@@ -332,7 +335,7 @@ class ResolveTaps(dlldump.DLLDump):
 
         # Now kernel mode taps
         print ">>> Working on kernel taps"
-        kern_taps = [t for t in taps if t[2] == 0]
+        kern_taps = [t for t in taps if t[1] == 0]
         sorted_mods = sorted([(mod.DllBase.v(), mod.SizeOfImage.v(), str(mod.BaseDllName))
             for mod in modules.lsmod(addr_space)])
         bases = [m[0] for m in sorted_mods]
@@ -340,5 +343,7 @@ class ResolveTaps(dlldump.DLLDump):
             yield v + ("Kernel",)
 
     def render_text(self, outfd, data):
-        for row in data:
-            print >>outfd, "%#010x %s %#010x %s %#010x %s" % row
+        for stack, symbols, cr3, procname in data:
+            for addr,sym in zip(stack, symbols):
+                print >>outfd, "%#010x %s" % (addr,sym),
+            print >>outfd, "%#010x %s" % (cr3, procname)
